@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<title>DOSPANEL v5.0 — DOS System Monitor</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{background:#111;display:flex;flex-direction:column;align-items:center;
+    justify-content:center;min-height:100vh;font-family:monospace;color:#555;}
+  h2{font-size:12px;letter-spacing:3px;text-transform:uppercase;margin-bottom:10px;color:#444;}
+  .display-frame{background:#0a0a0a;border:8px solid #1a1a1a;border-radius:12px;
+    padding:14px;box-shadow:0 0 60px rgba(0,0,0,.9),inset 0 0 15px rgba(0,0,0,.6);}
+  canvas{display:block;border-radius:3px;cursor:pointer;}
+  .controls{margin-top:14px;display:flex;align-items:center;gap:10px;font-size:11px;
+    flex-wrap:wrap;justify-content:center;}
+  .controls input{background:#1a1a1a;border:1px solid #333;color:#888;
+    padding:4px 8px;font-family:monospace;font-size:11px;border-radius:3px;width:150px;}
+  .controls button{background:#1a1a1a;border:1px solid #444;color:#888;
+    padding:4px 10px;font-family:monospace;font-size:11px;cursor:pointer;border-radius:3px;}
+  .controls button:hover,.controls button.active{border-color:#FFA800;color:#FFA800;}
+  .abtn{background:#1a1a1a;border:1px solid #444;color:#888;padding:4px 8px;
+    font-family:monospace;font-size:11px;cursor:pointer;border-radius:3px;}
+  .abtn:hover{border-color:#FFA800;color:#FFA800;}
+  .track-item{padding:3px 6px;cursor:pointer;font-size:11px;border-radius:3px;}
+  .track-item:hover{background:#1a1a1a;color:#FFA800;}
+  .track-item.playing{background:#0a200a;color:#00FC00;}
+  #wsStatus{font-size:11px;}
+  .dot-ok{color:#00FC00;}.dot-err{color:#FF0000;}.dot-wait{color:#FFA800;}
+</style>
+</head>
+<body>
+<h2>DOS System Monitor — Live View</h2>
+<div class="display-frame">
+  <canvas id="lcd" width="480" height="320"></canvas>
+</div>
+<div class="controls">
+  <span>ESP32 IP:</span>
+  <input id="ipInput" type="text" value="192.168.1.100">
+  <button onclick="wsConnect()">Connetti</button>
+  <span id="wsStatus" class="dot-wait">● In attesa</span>
+  <button id="pb0" onclick="setPage(0)" class="active">Pag 1</button>
+  <button id="pb1" onclick="setPage(1)">Pag 2</button>
+  <button id="pb2" onclick="setPage(2)">Pag 3</button>
+  <button id="pb3" onclick="setPage(3)">Pag 4 🎤</button>
+  <button id="pb4" onclick="setPage(4)">Pag 5 ♪</button>
+  <button onclick="downloadCSV()" title="Scarica log dati DOS">⬇ CSV</button>
+  <button onclick="window.location.href='/files'" title="Gestione file SD">📁 SD</button>
+</div>
+
+<!-- PANNELLO AUDIO — visibile solo su pagina 5 -->
+<script>
+// ── CANVAS ───────────────────────────────────────────────
+const canvas=document.getElementById('lcd');
+const ctx=canvas.getContext('2d');
+// Il click canvas per navigazione e comandi pagina 5 è gestito sotto
+
+const C={BG:'#000000',WHITE:'#FFFFFF',GREEN:'#00FC00',YELLOW:'#FFFF00',
+  RED:'#FF0000',CYAN:'#00FFFF',GRAY:'#7B7B7B',DKGREEN:'#007800',
+  AMBER:'#FFA800',ORANGE:'#FF8000'};
+
+let currentPage=0,wsConnected=false,ws=null,startTime=Date.now();
+
+let data={ram_kb:512,hh:0,mm:0,ss:0,dd:1,mo:1,yy:2026,
+  dos_major:7,dos_minor:1,drive_active:0,cpu:486,
+  bios:'AMI-010192',dsk:'C:204800',vol:'MSDOS',
+  caps:0,num:1,scroll:0,mouse:0,mx:0,my:0,mbtn:0,
+  com:9600,files:5,conn:0,
+  vuL:new Array(16).fill(0),vuR:new Array(16).fill(0)};
+
+// VU simulato quando non connesso
+let vuSimTimer=0;
+function simVU(dt){
+  vuSimTimer+=dt;
+  for(let b=0;b<16;b++){
+    let t=vuSimTimer/1000;
+    let target=Math.max(0,Math.min(1,(Math.sin(t*(0.5+b*0.1))+Math.sin(t*0.3))*0.3+0.1));
+    data.vuL[b]=data.vuL[b]*0.85+target*0.15;
+    let rFactor=0.8+(b%3)*0.1;
+    data.vuR[b]=data.vuR[b]*0.85+target*rFactor*0.15;
+  }
+}
+
+// ── UTILITY ──────────────────────────────────────────────
+function pad(n,w=2){return String(n).padStart(w,'0');}
+function hline(x,y,w,col){ctx.strokeStyle=col;ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(x,y+.5);ctx.lineTo(x+w,y+.5);ctx.stroke();}
+function vline(x,y,h,col){ctx.strokeStyle=col;ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(x+.5,y);ctx.lineTo(x+.5,y+h);ctx.stroke();}
+function fillRect(x,y,w,h,col){ctx.fillStyle=col;ctx.fillRect(x,y,w,h);}
+function strokeRect(x,y,w,h,col){ctx.strokeStyle=col;ctx.lineWidth=1;ctx.strokeRect(x+.5,y+.5,w-1,h-1);}
+function circle(x,y,r,col,fill=true){ctx.beginPath();ctx.arc(x,y,r,0,Math.PI*2);if(fill){ctx.fillStyle=col;ctx.fill();}else{ctx.strokeStyle=col;ctx.lineWidth=1;ctx.stroke();}}
+function txt(s,x,y,col,size=1,align='left'){ctx.fillStyle=col;ctx.font=`bold ${size*10}px monospace`;ctx.textAlign=align;ctx.fillText(s,x,y+size*10);ctx.textAlign='left';}
+
+// ── SPACE INVADERS ────────────────────────────────────────
+const ALIEN_A=[[0,0,1,0,0,0,0,0,1,0,0],[0,0,0,1,0,0,0,1,0,0,0],[0,0,1,1,1,1,1,1,1,0,0],[0,1,1,0,1,1,1,0,1,1,0],[1,1,1,1,1,1,1,1,1,1,1],[1,0,1,1,1,1,1,1,1,0,1],[1,0,1,0,0,0,0,0,1,0,1],[0,0,0,1,1,0,1,1,0,0,0]];
+const ALIEN_B=[[0,0,1,0,0,0,0,0,1,0,0],[1,0,0,1,0,0,0,1,0,0,1],[1,0,1,1,1,1,1,1,1,0,1],[1,1,1,0,1,1,1,0,1,1,1],[1,1,1,1,1,1,1,1,1,1,1],[0,1,1,1,1,1,1,1,1,1,0],[0,0,1,0,0,0,0,0,1,0,0],[0,1,0,0,0,0,0,0,0,1,0]];
+const SHIP_SI=[[0,0,0,0,0,1,0,0,0,0,0],[0,0,0,1,1,1,1,1,0,0,0],[0,1,1,1,1,1,1,1,1,1,0],[1,1,1,1,1,1,1,1,1,1,1]];
+const SHIELD_T=[[0,1,1,1,1,0],[1,1,1,1,1,1],[1,1,0,0,1,1],[1,1,0,0,1,1]];
+const SC=2,AX=8,AY=190,AW=464,AH=96,ALW=22,ALH=16;
+let si={aliens:[],ox:0,dir:1,drop:false,frame:0,timer:0,ship:AW/2,pbul:null,abuls:[],expls:[],shields:[],score:0,lives:3};
+function siAX(c){return AX+si.ox+c*(ALW+4);}function siAY(r){return AY+12+r*(ALH+4);}
+function siInit(){si.aliens=[];for(let r=0;r<2;r++)for(let c=0;c<8;c++)si.aliens.push({c,r,alive:true});si.ox=0;si.dir=1;si.drop=false;si.frame=0;si.timer=0;si.ship=AW/2;si.pbul=null;si.abuls=[];si.expls=[];si.shields=[60,160,260,360].map(x=>({x,y:AH-30,px:SHIELD_T.map(r=>[...r])}));}
+siInit();
+function siUpdate(dt){
+  si.timer+=dt;let alive=si.aliens.filter(a=>a.alive);if(!alive.length){siInit();return;}
+  for(let a of alive)if(siAY(a.r)+ALH>=AY+AH-4){siInit();return;}
+  let spd=300-Math.min(alive.length*10,250);
+  if(si.timer>=spd){si.timer=0;si.frame=1-si.frame;
+    if(si.drop){si.aliens.forEach(a=>a.r++);si.dir=-si.dir;si.drop=false;for(let a of si.aliens.filter(a=>a.alive))if(siAY(a.r)+ALH>=AY+AH-4){siInit();return;}}
+    else{si.ox+=si.dir*6;let mn=9999,mx=-9999;alive.forEach(a=>{let sx=siAX(a.c);mn=Math.min(mn,sx);mx=Math.max(mx,sx+ALW);});if(mx>=AX+AW-4||mn<=AX+4)si.drop=true;}
+    if(Math.random()<0.18&&alive.length){let a=alive[Math.floor(Math.random()*alive.length)];si.abuls.push({x:siAX(a.c)+ALW/2,y:siAY(a.r)+ALH});}
+  }
+  if(si.pbul){si.pbul.y-=5;if(si.pbul.y<AY){si.pbul=null;}else for(let a of si.aliens){if(!a.alive)continue;let ax=siAX(a.c),ay=siAY(a.r);if(si.pbul.x>=ax&&si.pbul.x<=ax+ALW&&si.pbul.y>=ay&&si.pbul.y<=ay+ALH){a.alive=false;si.expls.push({x:ax+ALW/2,y:ay+ALH/2,t:12});si.score+=10;si.pbul=null;break;}}}
+  let sx2=AX+si.ship-11,sy2=AY+AH-12;
+  si.abuls=si.abuls.filter(b=>{b.y+=3;if(b.y>AY+AH)return false;if(b.x>=sx2&&b.x<=sx2+22&&b.y>=sy2&&b.y<=sy2+8){si.lives--;si.expls.push({x:AX+si.ship,y:sy2+4,t:20});if(si.lives<=0){si.lives=3;si.score=0;siInit();}return false;}return true;});
+  si.expls=si.expls.filter(e=>{e.t--;return e.t>0;});
+  let ta=alive.reduce((b,a)=>a.r>b.r?a:b,alive[0]);let tx=siAX(ta.c)+ALW/2-AX;
+  if(Math.abs(si.ship-tx)>3)si.ship+=(tx>si.ship)?2:-2;si.ship=Math.max(14,Math.min(AW-14,si.ship));
+  if(!si.pbul&&Math.random()<0.04)si.pbul={x:AX+si.ship,y:AY+AH-16};
+}
+function drawSprite(sp,ax,ay,col,sc){ctx.fillStyle=col;for(let r=0;r<sp.length;r++)for(let c=0;c<sp[r].length;c++)if(sp[r][c])ctx.fillRect(ax+c*sc,ay+r*sc,sc,sc);}
+function siDraw(){
+  fillRect(AX,AY,AW,AH,'#000008');strokeRect(AX,AY,AW,AH,C.DKGREEN);
+  txt(`SCORE:${String(si.score).padStart(4,'0')}`,AX+4,AY-1,C.AMBER,1);
+  txt(`LIVES:${si.lives}`,AX+AW-55,AY-1,C.RED,1);
+  si.shields.forEach(sh=>sh.px.forEach((row,r)=>row.forEach((px,c)=>{if(px)fillRect(AX+sh.x+c*SC,AY+sh.y+r*SC,SC,SC,C.GREEN);})));
+  si.aliens.forEach(a=>{if(!a.alive)return;drawSprite(si.frame===0?ALIEN_A:ALIEN_B,siAX(a.c),siAY(a.r),a.r===0?C.CYAN:C.GREEN,SC);});
+  drawSprite(SHIP_SI,AX+si.ship-11,AY+AH-12,C.GREEN,SC);
+  if(si.pbul)fillRect(si.pbul.x-1,si.pbul.y,2,6,C.WHITE);
+  si.abuls.forEach(b=>fillRect(b.x-1,b.y,2,6,C.RED));
+  si.expls.forEach(e=>{let r=(12-e.t)*2;ctx.strokeStyle=C.YELLOW;ctx.lineWidth=1;for(let d=0;d<8;d++){let a=d/8*Math.PI*2;ctx.beginPath();ctx.moveTo(e.x+Math.cos(a)*r*.4,e.y+Math.sin(a)*r*.4);ctx.lineTo(e.x+Math.cos(a)*r,e.y+Math.sin(a)*r);ctx.stroke();}});
+  fillRect(AX+2,AY+AH-3,AW-4,1,C.GREEN);
+}
+
+// ── SNAKE ────────────────────────────────────────────────
+const SN_AX=8,SN_AY=190,SN_AW=464,SN_AH=96,SN_C=8;
+const SN_COLS=Math.floor(SN_AW/SN_C),SN_ROWS=Math.floor(SN_AH/SN_C);
+let sn={body:[],len:5,dx:1,dy:0,fx:0,fy:0,score:0,timer:0,dead:false};
+function snFood(){let ok=false;while(!ok){sn.fx=Math.floor(Math.random()*SN_COLS);sn.fy=Math.floor(Math.random()*SN_ROWS);ok=!sn.body.some(b=>b.x===sn.fx&&b.y===sn.fy);}}
+function snInit(){sn.len=5;sn.dx=1;sn.dy=0;sn.score=0;sn.dead=false;sn.timer=0;sn.body=Array.from({length:5},(_,i)=>({x:10-i,y:5}));snFood();}
+snInit();
+function snUpdate(dt){
+  sn.timer+=dt;let spd=Math.max(60,200-sn.score*2);if(sn.timer<spd)return;sn.timer=0;
+  if(sn.dead){snInit();return;}
+  let hx=sn.body[0].x,hy=sn.body[0].y;
+  let wx=(sn.fx>hx)?1:(sn.fx<hx)?-1:0,wy=(sn.fy>hy)?1:(sn.fy<hy)?-1:0;
+  let ndx=sn.dx,ndy=sn.dy;
+  if(wx!==0&&!(wx===-sn.dx&&sn.dy===0)){ndx=wx;ndy=0;}else if(wy!==0&&!(wy===-sn.dy&&sn.dx===0)){ndx=0;ndy=wy;}
+  let nx=hx+ndx,ny=hy+ndy,bad=nx<0||nx>=SN_COLS||ny<0||ny>=SN_ROWS||sn.body.some(b=>b.x===nx&&b.y===ny);
+  if(bad){const alts=[[1,0],[-1,0],[0,1],[0,-1]];for(let[ax,ay]of alts){if(ax===-sn.dx&&ay===0)continue;if(ay===-sn.dy&&ax===0)continue;let tx=hx+ax,ty=hy+ay;if(tx<0||tx>=SN_COLS||ty<0||ty>=SN_ROWS||sn.body.some(b=>b.x===tx&&b.y===ty))continue;ndx=ax;ndy=ay;nx=tx;ny=ty;bad=false;break;}}
+  sn.dx=ndx;sn.dy=ndy;nx=hx+sn.dx;ny=hy+sn.dy;
+  if(nx<0||nx>=SN_COLS||ny<0||ny>=SN_ROWS||sn.body.some(b=>b.x===nx&&b.y===ny)){sn.dead=true;return;}
+  sn.body.unshift({x:nx,y:ny});if(nx===sn.fx&&ny===sn.fy){sn.score+=10;snFood();}else sn.body.pop();
+}
+function snDraw(){
+  fillRect(SN_AX,SN_AY,SN_AW,SN_AH,'#000008');strokeRect(SN_AX,SN_AY,SN_AW,SN_AH,C.DKGREEN);
+  txt(`SNAKE:${String(sn.score).padStart(4,'0')}`,SN_AX+4,SN_AY-1,C.AMBER,1);
+  fillRect(SN_AX+sn.fx*SN_C+1,SN_AY+sn.fy*SN_C+1,SN_C-2,SN_C-2,C.RED);
+  sn.body.forEach((b,i)=>{let col=i===0?C.WHITE:i%2===0?C.GREEN:C.DKGREEN;fillRect(SN_AX+b.x*SN_C+1,SN_AY+b.y*SN_C+1,SN_C-2,SN_C-2,col);});
+  if(sn.dead)txt('GAME OVER',SN_AX+SN_AW/2-30,SN_AY+SN_AH/2-10,C.RED,1);
+}
+
+// ── PONG ─────────────────────────────────────────────────
+const PG_AX=8,PG_AY=190,PG_AW=464,PG_AH=96,PG_PW=4,PG_PH=20,PG_BW=5;
+let pg={bx:PG_AW/2,by:PG_AH/2,bdx:2,bdy:1.4,p1y:PG_AH/2,p2y:PG_AH/2,sc1:0,sc2:0,timer:0};
+function pgInit(){pg.bx=PG_AW/2;pg.by=PG_AH/2;pg.bdx=2;pg.bdy=1.4;pg.p1y=PG_AH/2;pg.p2y=PG_AH/2;}
+function pgUpdate(dt){
+  pg.timer+=dt;if(pg.timer<16)return;pg.timer=0;
+  pg.bx+=pg.bdx;pg.by+=pg.bdy;
+  if(pg.by<=2){pg.by=2;pg.bdy=Math.abs(pg.bdy);}if(pg.by>=PG_AH-PG_BW-2){pg.by=PG_AH-PG_BW-2;pg.bdy=-Math.abs(pg.bdy);}
+  if(pg.p1y<pg.by)pg.p1y=Math.min(pg.p1y+3,PG_AH-PG_PH/2-2);if(pg.p1y>pg.by)pg.p1y=Math.max(pg.p1y-3,PG_PH/2+2);
+  if(pg.p2y<pg.by)pg.p2y=Math.min(pg.p2y+3,PG_AH-PG_PH/2-2);if(pg.p2y>pg.by)pg.p2y=Math.max(pg.p2y-3,PG_PH/2+2);
+  if(pg.bx<=8+PG_PW+1&&pg.by>=pg.p1y-PG_PH/2&&pg.by<=pg.p1y+PG_PH/2){pg.bx=8+PG_PW+1;pg.bdx=Math.abs(pg.bdx)*1.05;pg.bdy+=(pg.by-pg.p1y)*0.1;}
+  if(pg.bx>=PG_AW-8-PG_PW-PG_BW-1&&pg.by>=pg.p2y-PG_PH/2&&pg.by<=pg.p2y+PG_PH/2){pg.bx=PG_AW-8-PG_PW-PG_BW-1;pg.bdx=-Math.abs(pg.bdx)*1.05;pg.bdy+=(pg.by-pg.p2y)*0.1;}
+  pg.bdx=Math.max(-6,Math.min(6,pg.bdx));pg.bdy=Math.max(-5,Math.min(5,pg.bdy));
+  if(pg.bx<2){pg.sc2++;pgInit();}if(pg.bx>PG_AW-2){pg.sc1++;pgInit();}
+  if(pg.sc1>=9||pg.sc2>=9){pg.sc1=0;pg.sc2=0;pgInit();}
+}
+function pgDraw(){
+  fillRect(PG_AX,PG_AY,PG_AW,PG_AH,'#000008');strokeRect(PG_AX,PG_AY,PG_AW,PG_AH,C.DKGREEN);
+  txt(`PONG  ${pg.sc1} : ${pg.sc2}`,PG_AX+PG_AW/2-30,PG_AY-1,C.AMBER,1);
+  for(let y=PG_AY+10;y<PG_AY+PG_AH-10;y+=8)fillRect(PG_AX+PG_AW/2-1,y,2,4,C.GRAY);
+  fillRect(PG_AX+6,PG_AY+pg.p1y-PG_PH/2,PG_PW,PG_PH,C.GREEN);
+  fillRect(PG_AX+PG_AW-6-PG_PW,PG_AY+pg.p2y-PG_PH/2,PG_PW,PG_PH,C.CYAN);
+  fillRect(PG_AX+Math.round(pg.bx),PG_AY+Math.round(pg.by),PG_BW,PG_BW,C.WHITE);
+}
+
+// ── VU METER ─────────────────────────────────────────────
+// Web Audio API per cattura microfono nel browser
+let audioCtx=null,analyser=null,micStream=null;
+const VU_BANDS=16;
+let webVuL=new Array(VU_BANDS).fill(0);
+let webVuR=new Array(VU_BANDS).fill(0);
+let webVuPL=new Array(VU_BANDS).fill(0);
+let webVuPR=new Array(VU_BANDS).fill(0);
+let useMicWeb=false;
+
+async function startWebMic(){
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({audio:true});
+    audioCtx=new AudioContext();
+    const src=audioCtx.createMediaStreamSource(stream);
+    analyser=audioCtx.createAnalyser();
+    analyser.fftSize=512;
+    src.connect(analyser);
+    micStream=stream;
+    useMicWeb=true;
+    document.getElementById('pb3').textContent='Pag 4 🎤 ON';
+  }catch(e){console.warn('Mic web non disponibile:',e);}
+}
+
+function updateWebVU(){
+  if(!analyser)return;
+  const freqData=new Uint8Array(analyser.frequencyBinCount);
+  analyser.getByteFrequencyData(freqData);
+  const bandSize=Math.floor(freqData.length/VU_BANDS);
+  for(let b=0;b<VU_BANDS;b++){
+    let sum=0;for(let i=b*bandSize;i<(b+1)*bandSize;i++)sum+=freqData[i];
+    let avg=sum/bandSize/255;
+    webVuL[b]=webVuL[b]*0.7+avg*0.3;
+    let rFactor=0.8+(b%3)*0.1;
+    webVuR[b]=webVuR[b]*0.7+avg*rFactor*0.3;
+    if(webVuL[b]>webVuPL[b])webVuPL[b]=webVuL[b];else webVuPL[b]*=0.995;
+    if(webVuR[b]>webVuPR[b])webVuPR[b]=webVuR[b];else webVuPR[b]*=0.995;
+  }
+}
+
+function drawVUBars(levels,peaks,chLabel,topY,maxH){
+  const LABEL_H=12;
+  const BAR_W=Math.floor((480-20)/VU_BANDS)-2;
+  txt(chLabel,8,topY,C.AMBER,1);
+  const dbL=['-40','-30','-24','-18','-12','-9','-6','-3','0','+3'];
+  const dbP=[0,1,2,3,5,7,9,11,13,15];
+  for(let i=0;i<10;i++){
+    let bx=20+dbP[i]*(BAR_W+2);
+    ctx.fillStyle=C.GRAY;ctx.font='bold 7px monospace';
+    ctx.fillText(dbL[i],bx,topY+LABEL_H-1);
+  }
+  for(let b=0;b<VU_BANDS;b++){
+    let bx=20+b*(BAR_W+2);
+    let fillH=Math.round(levels[b]*maxH);
+    let peakY=topY+LABEL_H+maxH-Math.round(peaks[b]*maxH);
+    fillRect(bx,topY+LABEL_H,BAR_W,maxH,'#0a1a0a');
+    if(fillH>0){
+      let gH=Math.min(fillH,Math.round(maxH*0.5));
+      let yH=Math.min(fillH-gH,Math.round(maxH*0.25));
+      let oH=Math.min(fillH-gH-yH,Math.round(maxH*0.15));
+      let rH=fillH-gH-yH-oH;
+      let y=topY+LABEL_H+maxH;
+      y-=gH; fillRect(bx,y,BAR_W,gH,C.GREEN);
+      y-=yH; fillRect(bx,y,BAR_W,yH,C.YELLOW);
+      y-=oH; fillRect(bx,y,BAR_W,oH,C.ORANGE);
+      y-=rH; fillRect(bx,y,BAR_W,rH,C.RED);
+      // Scanlines
+      for(let sy=topY+LABEL_H;sy<topY+LABEL_H+maxH;sy+=2){
+        ctx.fillStyle='rgba(0,0,0,0.15)';ctx.fillRect(bx,sy,BAR_W,1);}
+    }
+    if(peaks[b]>0.02){
+      ctx.fillStyle='#FFFFFF';ctx.fillRect(bx,peakY,BAR_W,2);}
+    strokeRect(bx,topY+LABEL_H,BAR_W,maxH,'#1a2a1a');
+  }
+}
+
+function vuDraw(){
+  const VU_TOP=40,VU_BOT=290,VU_H=VU_BOT-VU_TOP;
+  const CH_H=Math.floor((VU_H-16)/2);
+  // Usa dati dal WS se connesso, altrimenti usa microfono web o simulazione
+  let lL,lR,pL,pR;
+  if(wsConnected){lL=data.vuL;lR=data.vuR;pL=webVuPL;pR=webVuPR;}
+  else if(useMicWeb){lL=webVuL;lR=webVuR;pL=webVuPL;pR=webVuPR;}
+  else{lL=data.vuL;lR=data.vuR;pL=webVuPL;pR=webVuPR;}
+  drawVUBars(lL,pL,'L',VU_TOP+2,CH_H-12);
+  hline(8,VU_TOP+CH_H+8,464,C.DKGREEN);
+  drawVUBars(lR,pR,'R',VU_TOP+CH_H+14,CH_H-12);
+  // Indicatore sorgente
+  const src=wsConnected?'SORGENTE: ESP32 INMP441':useMicWeb?'SORGENTE: MICROFONO WEB':'SORGENTE: SIMULAZIONE';
+  txt(src,240,VU_BOT-10,wsConnected?C.GREEN:useMicWeb?C.CYAN:C.GRAY,1,'center');
+}
+
+// ── ELEMENTI COMUNI ───────────────────────────────────────
+function drawBorder(){strokeRect(2,2,476,316,C.AMBER);strokeRect(4,4,472,312,C.DKGREEN);}
+function drawTitle(extra=''){
+  txt('[ DOS SYSTEM MONITOR ]',10,12,C.AMBER,2);
+  if(extra)txt(extra,472,18,C.GRAY,1,'right');
+  hline(8,36,464,C.DKGREEN);
+}
+function drawLogo(){
+  const cx=425,cy=62,r=13,col=C.AMBER;
+  ctx.strokeStyle=col;ctx.lineWidth=1.2;ctx.lineCap='round';
+  ctx.beginPath();ctx.arc(cx,cy,r,0,Math.PI*2);ctx.stroke();
+  ctx.setLineDash([2,3]);ctx.beginPath();ctx.arc(cx,cy,r*.7,0,Math.PI*2);ctx.stroke();ctx.setLineDash([]);
+  [0,Math.PI/2,Math.PI,Math.PI*3/2].forEach(a=>{ctx.beginPath();ctx.moveTo(cx+Math.cos(a)*(r-1),cy+Math.sin(a)*(r-1));ctx.lineTo(cx+Math.cos(a)*(r+3),cy+Math.sin(a)*(r+3));ctx.stroke();});
+  ctx.lineWidth=1.5;[[-1,-1],[1,-1],[1,1],[-1,1]].forEach(([sx,sy])=>{const cr=r+5,cL=5,bx=cx+sx*cr,by=cy+sy*cr;ctx.beginPath();ctx.moveTo(bx,by);ctx.lineTo(bx-sx*cL,by);ctx.stroke();ctx.beginPath();ctx.moveTo(bx,by);ctx.lineTo(bx,by-sy*cL);ctx.stroke();});
+  ctx.lineWidth=1;ctx.lineCap='butt';
+  txt('Stellaris',cx-r-5-54,cy-4,col,1);
+}
+function drawStatus(){
+  hline(8,294,464,C.DKGREEN);
+  if(data.conn){txt('* CONNECTED  COM1 @ 9600',10,296,C.GREEN,1);}
+  else{txt('o WAITING FOR DOS...  ',10,296,C.RED,1);const w=ctx.measureText('o WAITING FOR DOS...  ').width;ctx.fillStyle=C.GRAY;ctx.font='bold 10px monospace';ctx.fillText('Run VUMONITOR.EXE on the PC',10+w,306);}
+  txt(wsConnected?'WS: LIVE':'WS: OFF',472,296,wsConnected?C.GREEN:C.RED,1,'right');
+  const sec=Math.floor((Date.now()-startTime)/1000);
+  txt(`UP:${pad(Math.floor(sec/3600))}:${pad(Math.floor((sec%3600)/60))}:${pad(sec%60)}`,360,296,C.GRAY,1);
+}
+function drawPageDots(){
+  for(let i=0;i<5;i++){const x=240-32+i*16,y=287;if(i===currentPage)circle(x,y,4,C.AMBER);else circle(x,y,4,C.GRAY,false);}
+}
+function drawArrows(){
+  ctx.font='bold 16px monospace';ctx.fillStyle=C.GRAY;
+  if(currentPage>0)ctx.fillText('<',6,158);
+  if(currentPage<4)ctx.fillText('>',462,158);
+}
+function drawScanlines(){ctx.fillStyle='rgba(0,0,0,.07)';for(let y=0;y<320;y+=2)ctx.fillRect(0,y,480,1);}
+
+// ── PAGINE ────────────────────────────────────────────────
+function drawPage1(){
+  txt(`${pad(data.hh)}:${pad(data.mm)}:${pad(data.ss)}`,10,42,C.GREEN,3);
+  txt(`${pad(data.dd)}/${pad(data.mo)}/${data.yy}`,10,75,C.GRAY,1);
+  const tot=640,used=tot-data.ram_kb,bX=80,bY=94,bW=388,bH=18;
+  txt('RAM:',10,98,C.AMBER,1);fillRect(bX,bY,bW,bH,'#111');
+  const fw=Math.round(Math.max(0,used)/tot*bW);
+  const bc=used>tot*.9?C.RED:used>tot*.75?C.YELLOW:C.GREEN;
+  fillRect(bX,bY,fw,bH,bc);for(let sy=bY;sy<bY+bH;sy+=2){ctx.fillStyle='rgba(0,0,0,.25)';ctx.fillRect(bX,sy,fw,1);}
+  strokeRect(bX,bY,bW,bH,C.GRAY);ctx.fillStyle='#000';ctx.font='bold 10px monospace';ctx.fillText(`${data.ram_kb}KB liberi / ${tot}KB`,bX+4,bY+13);
+  txt(`MS-DOS ${data.dos_major}.${data.dos_minor}`,10,122,C.CYAN,2);
+  txt('DRIVE ACTIVITY',36,152,C.AMBER,1);
+  if(data.drive_active){const g=ctx.createRadialGradient(18,167,0,18,167,24);g.addColorStop(0,'rgba(255,0,0,.9)');g.addColorStop(1,'rgba(255,0,0,0)');ctx.fillStyle=g;ctx.beginPath();ctx.arc(18,167,24,0,Math.PI*2);ctx.fill();circle(18,167,8,C.RED);}
+  else{circle(18,167,8,'#200000');circle(18,167,8,C.GRAY,false);}
+  vline(260,90,95,C.DKGREEN);
+  [['PWR',C.GREEN],['CLK',C.AMBER],['MEM',C.CYAN],['I/O',C.GREEN]].forEach(([lb,cl],i)=>{const lx=280+i*52,ly=130;const g=ctx.createRadialGradient(lx,ly,0,lx,ly,15);g.addColorStop(0,cl+'AA');g.addColorStop(1,'transparent');ctx.fillStyle=g;ctx.beginPath();ctx.arc(lx,ly,15,0,Math.PI*2);ctx.fill();circle(lx,ly,6,cl);txt(lb,lx,ly+8,C.GRAY,1,'center');});
+  strokeRect(268,157,200,22,C.DKGREEN);txt('SYSTEM OK',276,159,C.GREEN,1);
+  drawLogo();siDraw();
+}
+function drawPage2(){
+  drawLogo();txt('PROCESSOR:',10,42,C.AMBER,1);txt(`i${data.cpu}`,10,54,C.CYAN,2);
+  txt('BIOS:',10,80,C.AMBER,1);txt(data.bios,55,80,C.GREEN,1);hline(8,92,464,C.DKGREEN);
+  txt('DRIVES:',10,98,C.AMBER,1);let ypos=110;
+  data.dsk.split(',').forEach(entry=>{if(entry.length<3||ypos>182)return;const colon=entry.indexOf(':');if(colon<0)return;const letter=entry[0];const fkb=parseInt(entry.substring(colon+1))||0;txt(`${letter}:`,10,ypos,C.GRAY,1);const bX=30,bW=200,bH=8;fillRect(bX,ypos,bW,bH,'#111');const fw=Math.min(Math.round(fkb/2097152*bW),bW);fillRect(bX,ypos,fw,bH,C.GREEN);strokeRect(bX,ypos,bW,bH,C.GRAY);txt(`${fkb}KB`,bX+bW+4,ypos,C.WHITE,1);ypos+=12;});
+  txt('VOLUME:',10,170,C.AMBER,1);txt(data.vol,60,170,C.YELLOW,1);snDraw();
+}
+function ledInd(x,y,label,on,col){
+  if(on){const g=ctx.createRadialGradient(x,y,0,x,y,12);g.addColorStop(0,col+'CC');g.addColorStop(1,'transparent');ctx.fillStyle=g;ctx.beginPath();ctx.arc(x,y,12,0,Math.PI*2);ctx.fill();circle(x,y,6,col);circle(x,y,2,C.WHITE);}
+  else{circle(x,y,6,'#1a1a1a');circle(x,y,6,C.GRAY,false);}txt(label,x,y+8,on?col:C.GRAY,1,'center');
+}
+function drawPage3(){
+  drawLogo();txt('KEYBOARD:',10,42,C.AMBER,1);
+  ledInd(30,65,'CAP',data.caps,C.GREEN);ledInd(80,65,'NUM',data.num,C.CYAN);ledInd(130,65,'SCR',data.scroll,C.YELLOW);
+  vline(180,42,80,C.DKGREEN);txt('MOUSE:',190,42,C.AMBER,1);
+  if(data.mouse){txt('DETECTED',190,54,C.GREEN,1);txt(`X:${String(data.mx).padStart(3)} Y:${String(data.my).padStart(3)}`,190,66,C.WHITE,1);ledInd(200,85,'L',data.mbtn&1,C.RED);ledInd(220,85,'R',data.mbtn&2,C.RED);}
+  else txt('NOT FOUND',190,54,C.GRAY,1);
+  hline(8,105,464,C.DKGREEN);
+  txt('COM1 BAUD:',10,112,C.AMBER,1);txt(String(data.com),95,112,C.CYAN,1);
+  txt('OPEN FILES:',10,126,C.AMBER,1);txt(String(data.files),95,126,C.GREEN,1);
+  const bX=10,bY=138,bW=240,bH=10;fillRect(bX,bY,bW,bH,'#111');const fw=Math.min(Math.round(data.files/20*bW),bW);fillRect(bX,bY,fw,bH,C.GREEN);strokeRect(bX,bY,bW,bH,C.GRAY);
+  txt('DRIVE ACTIVITY',36,155,C.AMBER,1);
+  if(data.drive_active)circle(18,163,7,C.RED);else{circle(18,163,7,'#200000');circle(18,163,7,C.GRAY,false);}
+  pgDraw();
+}
+function drawPage4(){vuDraw();}
+
+// ── PAGINA 5 — AUDIO PLAYER NEL CANVAS ───────────────────
+let waveData=new Array(120).fill(0);
+let playerState={playing:false,paused:false,track:-1,elapsed:0,vol:50,total:0};
+
+function updateWaveWeb(){
+  if(!playerState.playing||playerState.paused){waveData=waveData.map(v=>v*0.85);return;}
+  const t=Date.now();
+  const base=Math.sin(t*0.003)*0.6+Math.sin(t*0.007)*0.3+Math.sin(t*0.013)*0.2;
+  const noise=(Math.random()-0.5)*0.3;
+  waveData.unshift((base+noise)*(playerState.vol/100)*100);
+  waveData.pop();
+}
+
+function drawPage5(){
+  txt('AUDIO PLAYER',10,42,C.AMBER,1);
+  hline(8,54,464,C.DKGREEN);
+  txt('NOW PLAYING:',10,60,C.GRAY,1);
+  const nm=playerState.track>=0&&playerTracks.length>playerState.track?playerTracks[playerState.track].name:'—';
+  txt(nm.length>40?nm.substring(0,40)+'...':nm,10,72,C.WHITE,1);
+  let stateStr='[] STOPPED',stateCol=C.GRAY;
+  if(playerState.playing&&!playerState.paused){stateStr='>> PLAYING';stateCol=C.GREEN;}
+  else if(playerState.paused){stateStr='|| PAUSED';stateCol=C.YELLOW;}
+  txt(stateStr,10,86,stateCol,1);
+  if(playerState.playing){
+    const m=Math.floor(playerState.elapsed/60),s=playerState.elapsed%60;
+    txt(`${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`,200,86,C.CYAN,1);
+  }
+  txt('VOL:',10,100,C.AMBER,1);
+  fillRect(45,100,200,8,'#111');fillRect(45,100,Math.round(playerState.vol/100*200),8,C.CYAN);
+  strokeRect(45,100,200,8,C.GRAY);txt(playerState.vol+'%',250,100,C.WHITE,1);
+  const btnY=118,btnH=30,btnW=80,isPlay=playerState.playing&&!playerState.paused;
+  strokeRect(10,btnY,btnW,btnH,C.GRAY);   txt('<< PREV',22,btnY+11,C.WHITE,1);
+  strokeRect(100,btnY,btnW,btnH,isPlay?C.YELLOW:C.GREEN); txt(isPlay?'|| PAUSE':'>> PLAY',108,btnY+11,isPlay?C.YELLOW:C.GREEN,1);
+  strokeRect(190,btnY,btnW,btnH,C.RED);   txt('[] STOP',208,btnY+11,C.RED,1);
+  strokeRect(280,btnY,btnW,btnH,C.GRAY);  txt('NEXT >>',293,btnY+11,C.WHITE,1);
+  strokeRect(370,btnY,40,btnH,C.GRAY);    txt('V-',381,btnY+11,C.CYAN,1);
+  strokeRect(420,btnY,50,btnH,C.GRAY);    txt('V+',431,btnY+11,C.CYAN,1);
+  hline(8,155,464,C.DKGREEN);vline(285,155,130,C.DKGREEN);
+  txt('PLAYLIST:',10,160,C.AMBER,1);txt(String(playerTracks.length),260,160,C.GRAY,1);
+  if(playerTracks.length===0){txt('Nessun file in /AUDIO',10,176,C.GRAY,1);}
+  else{
+    const start=Math.max(0,playerState.track-2),end=Math.min(playerTracks.length,start+6);
+    for(let i=start;i<end;i++){
+      const ly=172+(i-start)*18;
+      if(i===playerState.track){fillRect(8,ly-2,275,16,'#0a200a');txt('>',10,ly,C.GREEN,1);}
+      else txt(' ',10,ly,C.GRAY,1);
+      const tnm=playerTracks[i].name;
+      txt(tnm.length>28?tnm.substring(0,28):tnm,20,ly,i===playerState.track?C.GREEN:C.GRAY,1);
+    }
+  }
+  const WX=292,WY=160,WW=175,WH=120;
+  fillRect(WX,WY,WW,WH,C.BG);strokeRect(WX,WY,WW,WH,C.DKGREEN);
+  txt('WAVE',WX+4,WY+3,C.AMBER,1);
+  updateWaveWeb();
+  const midY=WY+WH/2;
+  if(playerState.playing&&!playerState.paused){
+    ctx.strokeStyle='#1a2a1a';ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(WX+1,midY);ctx.lineTo(WX+WW-1,midY);ctx.stroke();
+    let px=WX+2,py=midY;
+    for(let x=0;x<WW-4;x++){
+      const idx=Math.floor(x*waveData.length/(WW-4));
+      const sv=Math.max(-WH/2+4,Math.min(WH/2-4,waveData[idx]||0));
+      const cy=midY-sv;
+      ctx.strokeStyle=Math.abs(sv)>50?C.RED:Math.abs(sv)>25?C.YELLOW:C.GREEN;
+      ctx.beginPath();ctx.moveTo(px,py);ctx.lineTo(WX+2+x,cy);ctx.stroke();
+      px=WX+2+x;py=cy;
+    }
+  } else {
+    ctx.strokeStyle=C.DKGREEN;ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(WX+2,midY);ctx.lineTo(WX+WW-2,midY);ctx.stroke();
+    txt(playerState.paused?'PAUSED':'STOPPED',WX+35,WY+WH/2-4,C.GRAY,1);
+  }
+}
+
+// Click canvas pagina 5
+canvas.addEventListener('click',e=>{
+  if(currentPage!==4)return;
+  const rect=canvas.getBoundingClientRect();
+  const cx=(e.clientX-rect.left)*(480/rect.width);
+  const cy=(e.clientY-rect.top)*(320/rect.height);
+  const ip=document.getElementById('ipInput').value.trim();
+  if(!ip)return;
+  if(cy>=118&&cy<=148){
+    if(cx>=10&&cx<=89)       fetch(`http://${ip}/player?cmd=prev`).catch(()=>{});
+    else if(cx>=100&&cx<=179)fetch(`http://${ip}/player?cmd=pause`).catch(()=>{});
+    else if(cx>=190&&cx<=269)fetch(`http://${ip}/player?cmd=stop`).catch(()=>{});
+    else if(cx>=280&&cx<=359)fetch(`http://${ip}/player?cmd=next`).catch(()=>{});
+    else if(cx>=370&&cx<=409){playerState.vol=Math.max(0,playerState.vol-10);fetch(`http://${ip}/player?cmd=vol&v=${playerState.vol}`).catch(()=>{});}
+    else if(cx>=420){playerState.vol=Math.min(100,playerState.vol+10);fetch(`http://${ip}/player?cmd=vol&v=${playerState.vol}`).catch(()=>{});}
+  }
+  if(cy>=172&&cy<=284&&cx>=10&&cx<=280){
+    const start=Math.max(0,playerState.track-2);
+    const idx=start+Math.floor((cy-172)/18);
+    if(idx>=0&&idx<playerTracks.length)fetch(`http://${ip}/player?cmd=play&idx=${idx}`).catch(()=>{});
+  }
+});
+let lastTs=0;
+function loop(ts){
+  const dt=ts-lastTs;lastTs=ts;
+  siUpdate(dt);snUpdate(dt);pgUpdate(dt);
+  if(useMicWeb)updateWebVU();
+  else if(!wsConnected)simVU(dt);
+  fillRect(0,0,480,320,C.BG);drawBorder();
+  const labels=['1/5','2/5','3/5','4/5','5/5'];
+  drawTitle(labels[currentPage]);
+  switch(currentPage){
+    case 0:drawPage1();break;
+    case 1:drawPage2();break;
+    case 2:drawPage3();break;
+    case 3:drawPage4();break;
+    case 4:drawPage5();break;
+  }
+  drawPageDots();drawArrows();drawStatus();drawScanlines();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// Attiva microfono web al click su Pag 4
+document.getElementById('pb3').addEventListener('click',()=>{
+  if(!useMicWeb&&!audioCtx)startWebMic();
+});
+
+// ── WEBSOCKET ─────────────────────────────────────────────
+function setWsStatus(text,cls){const el=document.getElementById('wsStatus');el.textContent='● '+text;el.className=cls;}
+// ── AUDIO PLAYER ──────────────────────────────────────────
+let playerStatusInterval = null;
+let playerTracks = [];
+
+function setPage(p){
+  currentPage=p;
+  document.querySelectorAll('.controls button[id^=pb]').forEach((b,i)=>{
+    b.className=i===p?'active':'';});
+  // Pagina 5: avvia polling player e carica playlist
+  if(p===4){ loadPlaylist(); startPlayerPolling(); }
+  else { stopPlayerPolling(); }
+}
+
+function getIP(){ return document.getElementById('ipInput').value.trim(); }
+
+async function playerCmd(cmd, extra=''){
+  const ip=getIP(); if(!ip) return;
+  try{ await fetch(`http://${ip}/player?cmd=${cmd}${extra}`); }
+  catch(e){ console.warn('Player cmd error',e); }
+}
+
+async function playerPlayPause(){
+  const ip=getIP(); if(!ip) return;
+  try{
+    const r=await fetch(`http://${ip}/playerstatus`);
+    const s=await r.json();
+    if(s.playing && !s.paused) playerCmd('pause');
+    else if(s.paused) playerCmd('pause');
+    else playerCmd('play');
+  } catch(e){ playerCmd('play'); }
+}
+
+function setVolume(v){
+  document.getElementById('volVal').textContent=v+'%';
+  const ip=getIP(); if(!ip) return;
+  fetch(`http://${ip}/player?cmd=vol&v=${v}`).catch(()=>{});
+}
+
+async function loadPlaylist(){
+  const ip=getIP(); if(!ip) return;
+  try{
+    const r=await fetch(`http://${ip}/playlist`);
+    playerTracks=await r.json();
+    renderPlaylist();
+  } catch(e){ document.getElementById('playlist').innerHTML='<div style="color:#555;padding:4px">Connetti al display prima</div>'; }
+}
+
+function renderPlaylist(){
+  const pl=document.getElementById('playlist');
+  if(playerTracks.length===0){
+    pl.innerHTML='<div style="color:#555;padding:4px">Nessun file in /AUDIO sulla SD</div>';
+    return;
+  }
+  pl.innerHTML=playerTracks.map(t=>
+    `<div class="track-item${t.current?' playing':''}" onclick="playerCmd('play','&idx=${t.idx}')">
+      ${t.current?'▶':' '} ${t.name} <span style="color:#444;float:right">${t.type}</span>
+    </div>`
+  ).join('');
+}
+
+async function reloadPlaylist(){
+  await playerCmd('reload');
+  setTimeout(loadPlaylist, 500);
+}
+
+async function updatePlayerStatus(){
+  const ip=getIP(); if(!ip) return;
+  try{
+    const r=await fetch(`http://${ip}/playerstatus`);
+    const s=await r.json();
+    // Aggiorna playerState usato da drawPage5
+    playerState.playing=s.playing;
+    playerState.paused=s.paused;
+    playerState.track=s.track;
+    playerState.elapsed=s.elapsed;
+    playerState.vol=s.vol;
+    playerState.total=s.total;
+    // Aggiorna anche la lista tracce
+    playerTracks.forEach(t=>t.current=(t.idx===s.track));
+  } catch(e){}
+}
+
+function startPlayerPolling(){
+  if(playerStatusInterval) return;
+  playerStatusInterval=setInterval(updatePlayerStatus,1000);
+}
+function stopPlayerPolling(){
+  if(playerStatusInterval){ clearInterval(playerStatusInterval); playerStatusInterval=null; }
+}
+
+function downloadCSV(){
+  const ip=document.getElementById('ipInput').value.trim();
+  if(!ip){ alert('Inserisci prima l\'IP del display'); return; }
+  const url=`http://${ip}/datalog.csv`;
+  const a=document.createElement('a');
+  a.href=url;
+  a.download='DATALOG.CSV';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+}
+
+function wsConnect(){
+  const ip=document.getElementById('ipInput').value.trim();if(!ip)return;
+  if(ws)ws.close();setWsStatus('Connessione...','dot-wait');
+  ws=new WebSocket(`ws://${ip}:81`);
+  ws.onopen=()=>{wsConnected=true;setWsStatus(`Connesso a ${ip}`,'dot-ok');};
+  ws.onmessage=e=>{
+    try{const d=JSON.parse(e.data);
+      if(d.ram!==undefined)data.ram_kb=d.ram;if(d.hh!==undefined)data.hh=d.hh;if(d.mm!==undefined)data.mm=d.mm;if(d.ss!==undefined)data.ss=d.ss;
+      if(d.dd!==undefined)data.dd=d.dd;if(d.mo!==undefined)data.mo=d.mo;if(d.yy!==undefined)data.yy=d.yy;
+      if(d.dos_maj!==undefined)data.dos_major=d.dos_maj;if(d.dos_min!==undefined)data.dos_minor=d.dos_min;if(d.drv!==undefined)data.drive_active=d.drv;
+      if(d.cpu!==undefined)data.cpu=d.cpu;if(d.bios!==undefined)data.bios=d.bios;if(d.dsk!==undefined)data.dsk=d.dsk;if(d.vol!==undefined)data.vol=d.vol;
+      if(d.caps!==undefined)data.caps=d.caps;if(d.num!==undefined)data.num=d.num;if(d.scroll!==undefined)data.scroll=d.scroll;
+      if(d.mouse!==undefined)data.mouse=d.mouse;if(d.mx!==undefined)data.mx=d.mx;if(d.my!==undefined)data.my=d.my;if(d.mbtn!==undefined)data.mbtn=d.mbtn;
+      if(d.com!==undefined)data.com=d.com;if(d.files!==undefined)data.files=d.files;if(d.conn!==undefined)data.conn=d.conn;
+      if(d.vuL)data.vuL=d.vuL;if(d.vuR)data.vuR=d.vuR;
+    }catch(err){console.warn('JSON error',err);}
+  };
+  ws.onerror=()=>{wsConnected=false;setWsStatus('Errore','dot-err');};
+  ws.onclose=()=>{wsConnected=false;setWsStatus('Disconnesso','dot-err');};
+}
+</script>
+</body>
+</html>
