@@ -2,7 +2,7 @@
 
 A retro-style DOS system monitor running on the **JC3248W535** display module (ESP32-S3, 480×320, capacitive touch). Displays real-time data sent by a TSR program running on a vintage DOS PC, with built-in games, audio player, WiFi web interface, and microSD support.
 
-![DOSPANEL Screenshot](docs/screenshot.jpg)
+![DOSPANEL Screenshot](/screenshot.jpg)
 
 ---
 
